@@ -1,0 +1,10 @@
+/dumps
+/results
+*.bin
+*.cert
+*.zip
+client
+server
+gen_cert
+*.o
+.DS_Store
