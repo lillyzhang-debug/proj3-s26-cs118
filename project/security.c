@@ -11,8 +11,9 @@ char* hostname = NULL; // For client: storing inputted hostname
 EVP_PKEY* priv_key = NULL;
 tlv* client_hello = NULL;
 tlv* server_hello = NULL;
+uint16_t transcript_len = 0; // needs to be global
 
-uint8_t ts[1000] = {0};
+uint8_t ts[4096] = {0};
 uint16_t ts_len = 0;
 
 bool inc_mac = false;  // For testing only: send incorrect MACs
@@ -34,7 +35,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
     switch (state_sec) {
     case CLIENT_CLIENT_HELLO_SEND: {
         print("SEND CLIENT HELLO");
-        client_hello = create_tlv(CLIENT_HELLO); // create TLV packet with CLIENT_HELLO MSG 
+        client_hello = create_tlv(CLIENT_HELLO); // create TLV packet with CLIENT_HELLO MSG
         // generate nonce here
         tlv* nn = create_tlv(NONCE); // create a nonce TLV
         uint8_t nonce[NONCE_SIZE];
@@ -42,7 +43,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
 
         // append nonce to client hello packet
         add_val(nn, nonce, NONCE_SIZE);
-        add_tlv(client_hello, nn); 
+        add_tlv(client_hello, nn);
 
         // generate private key
         generate_private_key();
@@ -57,7 +58,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         memcpy(ts, buf, len);
         ts_len = len;
         free_tlv(client_hello);
-        state_sec = SERVER_CLIENT_HELLO_AWAIT; // i think this is the right state change
+        state_sec = CLIENT_SERVER_HELLO_AWAIT;
         return len;
     }
     case SERVER_SERVER_HELLO_SEND: {
@@ -71,9 +72,11 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         add_val(nn, nonce, NONCE_SIZE);
         add_tlv(server_hello, nn); // add nonce to server hello packet
 
+        load_certificate("server_cert.bin");
+        tlv* cert = deserialize_tlv(certificate, cert_size);
+        add_tlv(server_hello, cert);
+       
         // priv key and signature
-        load_private_key("server_key.bin"); // pass in the file server_cert.bin as the file name
-        // to generate ephemeral key
         generate_private_key();
         derive_public_key();
         tlv* pk = create_tlv(PUBLIC_KEY);
@@ -81,9 +84,24 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // Grab public key extern values and create tlv for them to append
         add_tlv(server_hello, pk);
 
+        uint8_t to_sign[4096];
+        uint16_t to_sign_len = 0;
+
+        memcpy(to_sign, ts, ts_len);
+        to_sign_len += ts_len;
+        to_sign_len += serialize_tlv(to_sign + to_sign_len, nn);
+
+        uint8_t cert_buf[2048];
+        uint16_t cert_buf_len = serialize_tlv(cert_buf, cert);
+        memcpy(to_sign + to_sign_len, cert_buf, cert_buf_len);
+        to_sign_len += cert_buf_len;
+        to_sign_len += serialize_tlv(to_sign + to_sign_len, pk);
+
         // sign current transcript
+        EVP_PKEY* ephemeral_key = get_private_key();
+        load_private_key("server_key.bin");
         uint8_t handshake_signature_bytes[128];
-        size_t sig_len = sign(handshake_signature_bytes, ts, ts_len);
+        size_t sig_len = sign(handshake_signature_bytes, to_sign, to_sign_len);
         // attach handshake
         tlv* sig = create_tlv(HANDSHAKE_SIGNATURE);
         add_val(sig, handshake_signature_bytes, sig_len);
@@ -95,24 +113,78 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // append server_hello to transcript (ts)
         memcpy(ts + ts_len, buf, len);
         ts_len += len;
+        transcript_len = ts_len;
 
         // derive secrets and keys
+        set_private_key(ephemeral_key);
         derive_secret();
-        derive_keys(ts, ts_len);
+        derive_keys(ts, transcript_len);
 
         free_tlv(server_hello);
-        state_sec = SERVER_FINISHED_AWAIT; 
+        state_sec = SERVER_FINISHED_AWAIT;
 
         return len;
     }
     case CLIENT_FINISHED_SEND: {
         print("SEND FINISHED");
-        //hmac();
+
+        uint8_t digest[MAC_SIZE];
+        hmac(digest, ts, transcript_len);
+
+        tlv* finished = create_tlv(FINISHED);
+        tlv* transcript = create_tlv(TRANSCRIPT);
+        add_val(transcript, digest, MAC_SIZE);
+        add_tlv(finished, transcript);
+
+        uint16_t len = serialize_tlv(buf, finished);
+        free_tlv(finished);
+        state_sec = DATA_STATE;
+        return len;
     }
     case DATA_STATE: {
+        uint8_t plaintext[943];
+        ssize_t plaintext_len = read(STDIN_FILENO, plaintext, 943);
+        if (plaintext_len <= 0)
+            return -1;
+
+        uint8_t iv[IV_SIZE];
+        uint8_t cipher[1000];
+
+        size_t cipher_len = encrypt_data(iv, cipher, plaintext, plaintext_len);
+
+        tlv* iv_tlv = create_tlv(IV);
+        add_val(iv_tlv, iv, IV_SIZE);
+
+        tlv* cipher_tlv = create_tlv(CIPHERTEXT);
+        add_val(cipher_tlv, cipher, cipher_len);
+
+        uint8_t mac_data[2000];
+        uint16_t mac_data_len = 0;
+        uint16_t iv_len = serialize_tlv(mac_data, iv_tlv);
+        mac_data_len += iv_len;
+        uint16_t ct_len = serialize_tlv(mac_data + mac_data_len, cipher_tlv);
+        mac_data_len += ct_len;
+
+        uint8_t mac[MAC_SIZE];
+        hmac(mac, mac_data, mac_data_len);
+        if (inc_mac) mac[0] ^= 0xFF;
+
+        tlv* mac_tlv = create_tlv(MAC);
+        add_val(mac_tlv, mac, MAC_SIZE);
+
+        tlv* data = create_tlv(DATA);
+        add_tlv(data, iv_tlv);
+        add_tlv(data, cipher_tlv);
+        add_tlv(data, mac_tlv);
+
+        uint16_t len = serialize_tlv(buf, data);
+        free_tlv(data);
+        return len;
+        break;
     }
     default:
         return 0;
+        break;
     }
 }
 
@@ -121,7 +193,7 @@ void output_sec(uint8_t* buf, size_t length) {
     case SERVER_CLIENT_HELLO_AWAIT: {
         client_hello = deserialize_tlv(buf, length);
         if(client_hello == NULL){
-            return -1; // return an error
+            return; // return an error
         }
 
         tlv* nn = get_tlv(client_hello, NONCE); // if we recv a client hello generate a nonce.
@@ -148,17 +220,114 @@ void output_sec(uint8_t* buf, size_t length) {
     }
     case CLIENT_SERVER_HELLO_AWAIT: {
         // recv serverhello
+        tlv* server_hello = deserialize_tlv(buf, length);
+
         //load_peer_public_key();
+        load_ca_public_key("ca_public_key.bin");
+
         //verify handshake sig and cert
-        load_ca_public_key("server_cert.bin");
+        tlv* cert = get_tlv(server_hello, CERTIFICATE);
+        tlv* sig = get_tlv(cert, SIGNATURE);
+        tlv* dns = get_tlv(cert, DNS_NAME);
+        tlv* pk = get_tlv(cert, PUBLIC_KEY);
+        tlv* lifetime = get_tlv(cert, LIFETIME);
+
+        uint8_t cert_data[2000];
+        uint16_t cert_data_len = 0;
+        cert_data_len += serialize_tlv(cert_data + cert_data_len, dns);
+        cert_data_len += serialize_tlv(cert_data + cert_data_len, pk);
+        cert_data_len += serialize_tlv(cert_data + cert_data_len, lifetime);
+
         //verify();
+        int cert_valid = verify(sig->val, sig->length, cert_data, cert_data_len, ec_ca_public_key);
+        if (!cert_valid) {
+            exit(1);
+        }
+        if (dns->length != strlen(hostname) ||
+            strncmp((char*)dns->val, hostname, dns->length) != 0) {
+            exit(2);
+        }
+
+        memcpy(ts + ts_len, buf, length);
+        ts_len += length;
+        transcript_len = ts_len; // saved for later
+
+        tlv* server_nonce = get_tlv(server_hello, NONCE);
+        tlv* server_cert = get_tlv(server_hello, CERTIFICATE);
+        tlv* server_pk = get_tlv(server_hello, PUBLIC_KEY);
+        tlv* handshake_sig = get_tlv(server_hello, HANDSHAKE_SIGNATURE);
+
+        uint8_t to_verify[4096];
+        uint16_t to_verify_len = 0;
+        memcpy(to_verify, ts, ts_len - length);
+        to_verify_len += ts_len - length;
+        to_verify_len += serialize_tlv(to_verify + to_verify_len, server_nonce);
+        to_verify_len += serialize_tlv(to_verify + to_verify_len, server_cert);
+        to_verify_len += serialize_tlv(to_verify + to_verify_len, server_pk);
+
+        load_peer_public_key(pk->val, pk->length);
+
+        int sig_valid = verify(handshake_sig->val, handshake_sig->length, to_verify, to_verify_len, ec_peer_public_key);
+        if (!sig_valid) {
+            exit(3);
+        }
+
+        load_peer_public_key(server_pk->val, server_pk->length);
+
+        derive_secret();
+        derive_keys(ts, transcript_len);
+
+        state_sec = CLIENT_FINISHED_SEND;
+        break;
     }
     case SERVER_FINISHED_AWAIT: {
+        print("RECV FINISHED");
+
+        tlv* finished = deserialize_tlv(buf, length);
+        tlv* transcript = get_tlv(finished, TRANSCRIPT);
+
+        uint8_t digest[MAC_SIZE];
+        hmac(digest, ts, transcript_len);
+
+        if (memcmp(digest, transcript->val, MAC_SIZE) != 0) {
+            exit(4);
+        }
+
+        free_tlv(finished);
+        state_sec = DATA_STATE;
+        break;
     }
     case DATA_STATE: {
         tlv* data = deserialize_tlv(buf, length);
+        tlv* iv_tlv = get_tlv(data, IV);
+        tlv* cipher_tlv = get_tlv(data, CIPHERTEXT);
+        tlv* mac_tlv = get_tlv(data, MAC);
+
+        uint8_t mac_data[2000];
+        uint16_t mac_data_len = 0;
+        uint16_t iv_len = serialize_tlv(mac_data, iv_tlv);
+        mac_data_len += iv_len;
+        uint16_t ct_len = serialize_tlv(mac_data + mac_data_len, cipher_tlv);
+        mac_data_len += ct_len;
+
+        uint8_t mac[MAC_SIZE];
+        hmac(mac, mac_data, mac_data_len);
+
+        if (memcmp(mac, mac_tlv->val, MAC_SIZE) != 0) {
+            exit(5);
+        }
+
+        uint8_t plaintext[1000];
+        size_t plaintext_len = decrypt_cipher(plaintext, cipher_tlv->val, cipher_tlv->length, iv_tlv->val);
+
+        write(STDOUT_FILENO, plaintext, plaintext_len);
+
+        free_tlv(data);
+        break;
     }
     default:
         break;
     }
 }
+
+
