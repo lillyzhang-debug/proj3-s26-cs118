@@ -63,42 +63,47 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
     }
     case SERVER_SERVER_HELLO_SEND: {
         print("SEND SERVER HELLO");
-        server_hello = create_tlv(SERVER_HELLO);
-
+        server_hello = create_tlv(SERVER_HELLO); // order according to project page *should* be Client-Hello, Nonce, Cert, Public Key, with sig following up all 4
+        
         // generate nonce here
         tlv* nn = create_tlv(NONCE); // create a nonce TLV
         uint8_t nonce[NONCE_SIZE];
         generate_nonce(nonce, NONCE_SIZE);
         add_val(nn, nonce, NONCE_SIZE);
-        add_tlv(server_hello, nn); // add nonce to server hello packet
+        //add_tlv(server_hello, nn); // add nonce to server hello packet  moved to *after serialization*
 
         load_certificate("server_cert.bin");
-        tlv* cert = deserialize_tlv(certificate, cert_size);
-        add_tlv(server_hello, cert);
+        tlv* cert = deserialize_tlv(certificate, cert_size); // since cert is loaded from the .bin, no need to create a new tlv?
+        // tlv* cert = create_tlv(CERTIFICATE);
+        // add_val(cert, certificate, cert_size);
+        // add_tlv(server_hello, cert);
        
         // priv key and signature
         generate_private_key();
         derive_public_key();
+        // save ephemeral key
+        EVP_PKEY* ephemeral_key = get_private_key();
         tlv* pk = create_tlv(PUBLIC_KEY);
         add_val(pk, public_key, pub_key_size);
         // Grab public key extern values and create tlv for them to append
-        add_tlv(server_hello, pk);
+        // add_tlv(server_hello, pk);
 
         uint8_t to_sign[4096];
         uint16_t to_sign_len = 0;
-
-        memcpy(to_sign, ts, ts_len);
+        
+        memcpy(to_sign + to_sign_len, ts, ts_len); // supposed to account for the recved client-hello
         to_sign_len += ts_len;
-        to_sign_len += serialize_tlv(to_sign + to_sign_len, nn);
 
-        uint8_t cert_buf[2048];
-        uint16_t cert_buf_len = serialize_tlv(cert_buf, cert);
-        memcpy(to_sign + to_sign_len, cert_buf, cert_buf_len);
-        to_sign_len += cert_buf_len;
+        to_sign_len += serialize_tlv(to_sign + to_sign_len, nn);
+        to_sign_len += serialize_tlv(to_sign + to_sign_len, cert);
         to_sign_len += serialize_tlv(to_sign + to_sign_len, pk);
 
+        // moved add tlvs here
+        add_tlv(server_hello, nn);
+        add_tlv(server_hello, cert);
+        add_tlv(server_hello, pk);
+
         // sign current transcript
-        EVP_PKEY* ephemeral_key = get_private_key();
         load_private_key("server_key.bin");
         uint8_t handshake_signature_bytes[128];
         size_t sig_len = sign(handshake_signature_bytes, to_sign, to_sign_len);
@@ -107,8 +112,18 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         add_val(sig, handshake_signature_bytes, sig_len);
         add_tlv(server_hello, sig);
 
-        // serialize
+        // serialize server_hello
         uint16_t len = serialize_tlv(buf, server_hello);
+
+        // create salt for symmetric key derivation
+        uint8_t salt_buf[4096];
+        uint16_t salt_len = 0;
+
+        memcpy(salt_buf, ts, ts_len); // client hello
+        salt_len += ts_len;
+
+        memcpy(salt_buf + salt_len, buf, len); // server hello
+        salt_len += len;
 
         // append server_hello to transcript (ts)
         memcpy(ts + ts_len, buf, len);
@@ -118,7 +133,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // derive secrets and keys
         set_private_key(ephemeral_key);
         derive_secret();
-        derive_keys(ts, transcript_len);
+        derive_keys(salt_buf, salt_len);
 
         free_tlv(server_hello);
         state_sec = SERVER_FINISHED_AWAIT;
@@ -193,7 +208,7 @@ void output_sec(uint8_t* buf, size_t length) {
     case SERVER_CLIENT_HELLO_AWAIT: {
         client_hello = deserialize_tlv(buf, length);
         if(client_hello == NULL){
-            return; // return an error
+            return(6); // return an error
         }
 
         tlv* nn = get_tlv(client_hello, NONCE); // if we recv a client hello generate a nonce.
@@ -221,22 +236,29 @@ void output_sec(uint8_t* buf, size_t length) {
     case CLIENT_SERVER_HELLO_AWAIT: {
         // recv serverhello
         tlv* server_hello = deserialize_tlv(buf, length);
+        if (server_hello == NULL || server_hello->type != SERVER_HELLO) exit(6);
 
         //load_peer_public_key();
         load_ca_public_key("ca_public_key.bin");
 
         //verify handshake sig and cert
         tlv* cert = get_tlv(server_hello, CERTIFICATE);
+        if(!cert) exit(6);
         tlv* sig = get_tlv(cert, SIGNATURE);
         tlv* dns = get_tlv(cert, DNS_NAME);
         tlv* pk = get_tlv(cert, PUBLIC_KEY);
         tlv* lifetime = get_tlv(cert, LIFETIME);
 
-        uint8_t cert_data[2000];
+        uint8_t cert_data[4096];
         uint16_t cert_data_len = 0;
         cert_data_len += serialize_tlv(cert_data + cert_data_len, dns);
         cert_data_len += serialize_tlv(cert_data + cert_data_len, pk);
         cert_data_len += serialize_tlv(cert_data + cert_data_len, lifetime);
+
+        load_ca_public_key("ca_public_key.bin"); 
+        if (!verify(sig->val, sig->length, cert_data, cert_data_len, ec_ca_public_key)) { // verify pub key
+            exit(1);
+        }
 
         //verify();
         int cert_valid = verify(sig->val, sig->length, cert_data, cert_data_len, ec_ca_public_key);
