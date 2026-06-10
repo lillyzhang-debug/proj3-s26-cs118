@@ -163,7 +163,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             return -1;
 
         uint8_t iv[IV_SIZE];
-        uint8_t cipher[1000];
+        uint8_t cipher[2000];
 
         size_t cipher_len = encrypt_data(iv, cipher, plaintext, plaintext_len);
 
@@ -173,7 +173,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         tlv* cipher_tlv = create_tlv(CIPHERTEXT);
         add_val(cipher_tlv, cipher, cipher_len);
 
-        uint8_t mac_data[2000];
+        uint8_t mac_data[4096];
         uint16_t mac_data_len = 0;
         uint16_t iv_len = serialize_tlv(mac_data, iv_tlv);
         mac_data_len += iv_len;
@@ -265,8 +265,8 @@ void output_sec(uint8_t* buf, size_t length) {
         if (!cert_valid) {
             exit(1);
         }
-        if (dns->length != strlen(hostname) ||
-            strncmp((char*)dns->val, hostname, dns->length) != 0) {
+        if (dns->length < strlen(hostname) ||
+            strncmp((char*)dns->val, hostname, strlen(hostname)) != 0) {
             exit(2);
         }
 
@@ -296,8 +296,15 @@ void output_sec(uint8_t* buf, size_t length) {
 
         load_peer_public_key(server_pk->val, server_pk->length);
 
+        uint8_t salt_buf[4096];
+        uint16_t salt_len = 0;
+        memcpy(salt_buf, ts, ts_len - length);
+        salt_len += ts_len - length;
+        memcpy(salt_buf + salt_len, buf, length);
+        salt_len += length;
+
         derive_secret();
-        derive_keys(ts, transcript_len);
+        derive_keys(salt_buf, salt_len);
 
         state_sec = CLIENT_FINISHED_SEND;
         break;
@@ -325,7 +332,7 @@ void output_sec(uint8_t* buf, size_t length) {
         tlv* cipher_tlv = get_tlv(data, CIPHERTEXT);
         tlv* mac_tlv = get_tlv(data, MAC);
 
-        uint8_t mac_data[2000];
+        uint8_t mac_data[4096];
         uint16_t mac_data_len = 0;
         uint16_t iv_len = serialize_tlv(mac_data, iv_tlv);
         mac_data_len += iv_len;
@@ -339,7 +346,7 @@ void output_sec(uint8_t* buf, size_t length) {
             exit(5);
         }
 
-        uint8_t plaintext[1000];
+        uint8_t plaintext[2000];
         size_t plaintext_len = decrypt_cipher(plaintext, cipher_tlv->val, cipher_tlv->length, iv_tlv->val);
 
         write(STDOUT_FILENO, plaintext, plaintext_len);
