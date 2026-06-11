@@ -60,6 +60,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         free_tlv(client_hello);
         state_sec = CLIENT_SERVER_HELLO_AWAIT;
         return len;
+        break;
     }
     case SERVER_SERVER_HELLO_SEND: {
         print("SEND SERVER HELLO");
@@ -139,6 +140,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         state_sec = SERVER_FINISHED_AWAIT;
 
         return len;
+        break;
     }
     case CLIENT_FINISHED_SEND: {
         print("SEND FINISHED");
@@ -155,12 +157,13 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         free_tlv(finished);
         state_sec = DATA_STATE;
         return len;
+        break;
     }
     case DATA_STATE: {
         uint8_t plaintext[943];
         ssize_t plaintext_len = read(STDIN_FILENO, plaintext, 943);
         if (plaintext_len <= 0)
-            return -1;
+            return 0;
 
         uint8_t iv[IV_SIZE];
         uint8_t cipher[2000];
